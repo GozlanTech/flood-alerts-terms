@@ -86,6 +86,9 @@ const $ = (id) => document.getElementById(id);
 const grids = {};
 let meta, model, step, map;
 
+// Hebrew map labels need right-to-left shaping; the engine does not do it natively.
+maplibregl.setRTLTextPlugin("https://unpkg.com/@mapbox/mapbox-gl-rtl-text@0.2.3/mapbox-gl-rtl-text.min.js", true);
+
 const corners = ([[s, w], [n, e]]) => [[w, n], [e, n], [e, s], [w, s]];
 
 function bilinear(g, lat, lon) {
