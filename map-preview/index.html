@@ -66,10 +66,11 @@
     <details>
       <summary>שכבות, מקורות והבהרות</summary>
       <div class="body">
+        <label class="chk"><input type="checkbox" id="streams" checked> נחלים ושמותיהם</label>
         <label class="chk"><input type="checkbox" id="basins" checked> אגני ניקוז</label>
         <label class="chk">שקיפות <input type="range" id="opacity" min="30" max="100" value="100" aria-label="שקיפות שכבת הגשם"></label>
         <p class="note">המפה מבוססת על תחזיות מודלים מספריים ואינה אזהרה רשמית ואינה מחליפה אותן. אין להיכנס לאפיקי נחלים בזמן גשם.</p>
-        <p class="note">נתוני גשם: <span id="attr"></span>. אגני ניקוז: משרד החקלאות וביטחון המזון, תחום GIS, כל הזכויות שמורות למדינת ישראל &copy;.
+        <p class="note">נתוני גשם: <span id="attr"></span>. אגני ניקוז: משרד החקלאות וביטחון המזון, תחום GIS, כל הזכויות שמורות למדינת ישראל &copy;. נחלים: שכבת "נחלים בתמ"א 1" (ArcGIS Online).
           מפת רקע: OpenFreeMap, &copy; OpenMapTiles, נתוני OpenStreetMap.</p>
       </div>
     </details>
@@ -80,6 +81,13 @@
 const BASINS = "https://services3.arcgis.com/Fqk0gVrfcnumlR5m/arcgis/rest/services/aganim50/FeatureServer/0/query" +
   "?where=1%3D1&outFields=OBJECTID&geometry=34.0,29.4,36.4,33.4&geometryType=esriGeometryEnvelope&inSR=4326" +
   "&spatialRel=esriSpatialRelIntersects&outSR=4326&maxAllowableOffset=0.001&geometryPrecision=4&f=geojson";
+const STREAMS = "https://services1.arcgis.com/hWUp5lYOh3Fi9WoQ/arcgis/rest/services/StreamsTMA1_2020/FeatureServer/0/query" +
+  "?where=1%3D1&outFields=NAME&geometry=34.0,29.4,36.4,33.4&geometryType=esriGeometryEnvelope&inSR=4326" +
+  "&spatialRel=esriSpatialRelIntersects&outSR=4326&maxAllowableOffset=0.001&geometryPrecision=4&f=geojson";
+// the planning layer stores bare names ("נחשון"); add "נחל" unless the name already carries a water-course word
+const STREAM_LABEL = ["case",
+  ["any", ...["נחל", "ערוץ", "תעלת", "פלג", "יובל", "אפיק"].map((w) => ["==", ["index-of", w, ["get", "NAME"]], 0])],
+  ["get", "NAME"], ["concat", "נחל ", ["get", "NAME"]]];
 const fmt = new Intl.DateTimeFormat("he-IL", { timeZone: "Asia/Jerusalem", weekday: "long", day: "2-digit",
   month: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
 const $ = (id) => document.getElementById(id);
@@ -119,19 +127,56 @@ function show() {
   loadGrid(model, st.hours);
 }
 
+const HE = ["coalesce", ["get", "name:he"], ["get", "name"]];
+// drop any label that names the Palestinian territories (Hebrew or English OSM name)
+const NO_PAL = [
+  ["==", ["index-of", "פלסטינ", ["to-string", ["coalesce", ["get", "name:he"], ["get", "name"], ""]]], -1],
+  ["==", ["index-of", "Palestin", ["to-string", ["coalesce", ["get", "name:en"], ["get", "name_en"], ["get", "name"], ""]]], -1],
+];
+const TERRAIN = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
+
+function patchStyle(style) {
+  // Hebrew labels, minus the filtered ones
+  style.layers.forEach((l) => {
+    if (l.type === "symbol" && l.layout && l.layout["text-field"]) {
+      l.layout["text-field"] = HE;
+      l.filter = l.filter ? ["all", l.filter, ...NO_PAL] : ["all", ...NO_PAL];
+    }
+  });
+  // topography: hillshade under water/roads, from open terrain tiles
+  style.sources.dem = { type: "raster-dem", tiles: [TERRAIN], encoding: "terrarium", tileSize: 256, maxzoom: 14,
+    attribution: "Terrain: AWS Open Data (Mapzen, SRTM)" };
+  const at = (id) => style.layers.findIndex((l) => l.id === id);
+  style.layers.splice(at("water"), 0, { id: "hillshade", type: "hillshade", source: "dem",
+    paint: { "hillshade-exaggeration": 0.6, "hillshade-shadow-color": "#4d4a40", "hillshade-highlight-color": "#ffffff",
+      "hillshade-accent-color": "#6b675a" } });
+  // rivers/wadis: stronger lines above the rain layer, with names from a lower zoom
+  const [ww] = style.layers.splice(at("waterway"), 1);
+  ww.paint["line-color"] = "#4f93d1";
+  ww.paint["line-width"] = ["interpolate", ["linear"], ["zoom"], 7, 0.6, 12, 1.8];
+  style.layers.splice(at("waterway_line_label"), 0, ww);
+  const wl = style.layers[at("waterway_line_label")];
+  wl.minzoom = 8;
+  wl.layout["text-size"] = 12;
+  Object.assign(wl.paint, { "text-color": "#1d5a9a", "text-halo-color": "#ffffff", "text-halo-width": 1.5 });
+  // named peaks
+  style.layers.splice(at("label_other"), 0, { id: "peaks", type: "symbol", source: "openmaptiles", "source-layer": "mountain_peak",
+    minzoom: 9, filter: ["all", ["has", "name"], ...NO_PAL],
+    layout: { "text-field": ["concat", "▲ ", HE], "text-font": ["Noto Sans Regular"], "text-size": 11, "text-anchor": "center" },
+    paint: { "text-color": "#6d4c41", "text-halo-color": "#ffffff", "text-halo-width": 1.3 } });
+}
+
 async function init() {
   meta = await (await fetch("meta.json")).json();
   const style = await (await fetch("https://tiles.openfreemap.org/styles/positron")).json();
-  // prefer the Hebrew name where OpenStreetMap has one
-  style.layers.forEach((l) => { if (l.type === "symbol" && l.layout && l.layout["text-field"])
-    l.layout["text-field"] = ["coalesce", ["get", "name:he"], ["get", "name"]]; });
+  patchStyle(style);
   const keys = Object.keys(meta.models);
   model = keys[0];
   const first = meta.models[model];
   map = new maplibregl.Map({ container: "map", style, bounds: [[first.bounds[0][1], first.bounds[0][0]], [first.bounds[1][1], first.bounds[1][0]]],
-    fitBoundsOptions: { padding: 8 }, minZoom: 6, maxZoom: 12, attributionControl: { compact: true }, dragRotate: false });
+    fitBoundsOptions: { padding: 8 }, minZoom: 6, maxZoom: 12, attributionControl: { compact: true }, dragRotate: false, hash: true });
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-left");
-  const firstSymbol = style.layers.find((l) => l.type === "symbol").id;
+  const firstSymbol = "waterway_line_label";
 
   const slider = $("slider");
   keys.forEach((k) => {
@@ -148,13 +193,27 @@ async function init() {
 
   map.on("load", async () => {
     map.addSource("rain", { type: "image", url: `ov/${model}_${first.steps[step].hours}.png`, coordinates: corners(first.bounds) });
-    map.addLayer({ id: "rain", type: "raster", source: "rain", paint: { "raster-fade-duration": 0, "raster-resampling": "linear" } }, firstSymbol);
+    map.addLayer({ id: "rain", type: "raster", source: "rain", paint: { "raster-fade-duration": 0, "raster-resampling": "linear" } }, "waterway");
     try {
       const geo = await (await fetch(BASINS)).json();
       map.addSource("basins", { type: "geojson", data: geo });
       map.addLayer({ id: "basins", type: "line", source: "basins",
         paint: { "line-color": "#37474f", "line-width": 0.8, "line-opacity": 0.5 } }, firstSymbol);
     } catch (e) { $("basins").disabled = true; }
+    try {
+      const geo = await (await fetch(STREAMS)).json();
+      map.addSource("streams", { type: "geojson", data: geo });
+      map.addLayer({ id: "streams", type: "line", source: "streams", minzoom: 7.5,
+        paint: { "line-color": "#2f7fc1", "line-width": ["interpolate", ["linear"], ["zoom"], 7, 0.7, 12, 2.2], "line-opacity": 0.9 } }, firstSymbol);
+      map.addLayer({ id: "streams-label", type: "symbol", source: "streams", minzoom: 9.2,
+        layout: { "symbol-placement": "line", "text-field": STREAM_LABEL, "text-font": ["Noto Sans Regular"], "text-size": 11.5,
+          "symbol-spacing": 350, "text-max-angle": 40 },
+        paint: { "text-color": "#14518f", "text-halo-color": "#ffffff", "text-halo-width": 1.6 } });
+      // official stream names replace the sparse OpenStreetMap waterways
+      ["waterway", "waterway_line_label"].forEach((id) => map.setLayoutProperty(id, "visibility", "none"));
+    } catch (e) { $("streams").disabled = true; }
+    $("streams").onchange = (e) => ["streams", "streams-label"].forEach((id) =>
+      map.getLayer(id) && map.setLayoutProperty(id, "visibility", e.target.checked ? "visible" : "none"));
     $("basins").onchange = (e) => map.getLayer("basins") && map.setLayoutProperty("basins", "visibility", e.target.checked ? "visible" : "none");
     show();
   });
